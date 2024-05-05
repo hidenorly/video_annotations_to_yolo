@@ -8,6 +8,7 @@ inherently available. Please note that video annotations should be exported in t
 """
 
 import argparse
+import os
 import json
 import csv
 import copy
@@ -33,23 +34,33 @@ def linear_interpolation(prev_seq, seq, label):
         frames_info[frame] = info
     return frames_info
 
-def main(json_path, video_path, output_base):
-    print("Parsing annotations from JSON")
-    # Open the annotation file, which should be exported in "JSON-MIN" format
-    with open(json_path) as f:
-        video_labels = json.load(f, parse_float=Decimal)
+def main(video_label, output_base, offset=0, labels=set()):
+    video_path = video_label["video"]
+    labels_dict = {k:i for i,k in enumerate(labels)}
 
-    labels = set()
-    for subject in video_labels[0]['box']:
-        labels.add(*subject['labels'])
-    labels_dict = {k:i for i,k in enumerate(sorted(labels))}
+    # extract count of frames
+    max_frames = 0
+    for subject in video_label['box']:
+        if "framesCount" in subject:
+            _frame_count = int( subject["framesCount"] )
+            if _frame_count > max_frames:
+                max_frames = _frame_count
+
+    # prepare metadata available frame flags
+    availableFrames = [False] * (max_frames+1)
+    for subject in video_label['box']:
+        start_frame = subject['sequence'][0]["frame"]
+        end_frame = subject['sequence'][len(subject['sequence'])-1]["frame"]
+        print(f'{subject['labels'][0]} : {start_frame+offset} - {end_frame+offset}')
+        for i in range(start_frame, end_frame):
+            availableFrames[i] = True
 
     # Initialize dictionaries to store file information and frame timestamps
     files_dict = dict()
     frame_times = dict()
 
     # Loop over the subjects, i.e. football players in a match
-    for subject in copy.deepcopy(video_labels[0]['box']):
+    for subject in copy.deepcopy(video_label['box']):
         # Get the subject labels (e.g. team-A, team-B, referee, ball)
         subject_labels = subject['labels']
 
@@ -104,33 +115,33 @@ def main(json_path, video_path, output_base):
     output_path = Path(output_base)
     [(output_path / p).mkdir(parents=True, exist_ok=True) for p in ('images/', 'labels/')]
 
-    # Write the YOLO classes
-    with open(output_path / f'classes.txt', 'w') as f:
-        f.writelines(f'{line}\n' for line in labels_dict)
-
     max_frame = max(files_dict.keys())
     padding = len(str(max_frame))
 
     # Write the YOLO labels
     for frame, lines in files_dict.items():
-        with open(output_path / 'labels' / f'frame_{frame:0{padding}d}.txt', 'w') as csvfile:
-            csvwriter = csv.writer(csvfile, delimiter=' ')
-            csvwriter.writerows(lines)
+        if availableFrames[frame]:
+            with open(output_path / 'labels' / f'frame_{offset+frame:0{padding}d}.txt', 'w') as csvfile:
+                csvwriter = csv.writer(csvfile, delimiter=' ')
+                csvwriter.writerows(lines)
 
     # Extract the Frames
-    if video_path is not None:
+    if os.path.isfile(video_path):
         vidcap = cv2.VideoCapture(video_path)
         print(f'Extracting frames')
         for frame in tqdm(files_dict):
-            vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame-1)
-            success, image = vidcap.read()
-            if success:
-                cv2.imwrite(str(output_path / 'images' / f'frame_{frame:0{padding}d}.jpg'), image)
-            else:
-                print(f"Unable to read frame {frame}. Quiting.")
-                break
+            if availableFrames[frame]:
+                vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame-1)
+                success, image = vidcap.read()
+                if success:
+                    cv2.imwrite(str(output_path / 'images' / f'frame_{offset+frame:0{padding}d}.jpg'), image)
+                else:
+                    print(f"Unable to read frame {frame}. Quiting.")
+                    break
     
     print("Process finished successfully.")
+
+    return offset+len(tqdm(files_dict))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -146,4 +157,34 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output_base", default='output/', help="Path to output base directory")
     args = parser.parse_args()
 
-    main(args.json_path, args.video_path, args.output_base)
+    print("Parsing annotations from JSON")
+    video_labels = []
+    with open(args.json_path) as f:
+        video_labels = json.load(f, parse_float=Decimal)
+        # replace from video uri in the export file to actual path
+        for video in video_labels:
+            if "video" in video:
+                video_path = video["video"]
+                pos = video_path.rfind("/")
+                if pos!=None:
+                    video_path = os.path.join(args.video_path, video_path[pos+1:])
+                    if os.path.isfile(video_path):
+                        video["video"] = video_path
+
+    # extract labels
+    labels = set()
+    for video_label in video_labels:
+        for subject in video_label['box']:
+            labels.add(*subject['labels'])
+    labels = sorted(labels)
+    print(f'labels = {labels}')
+
+    # extract video frames and output yolo formated frame_xxxx.txt
+    frame_count = 0
+    for video_label in video_labels:
+        print(f'{video_label["video"]}......')
+        frame_count += main(video_label, args.output_base, frame_count, labels)
+
+    # Write the YOLO classes
+    with open(os.path.join(args.output_base, f'classes.txt'), 'w') as f:
+        f.writelines(f'{line}\n' for line in labels)
